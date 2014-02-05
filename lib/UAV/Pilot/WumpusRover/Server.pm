@@ -361,4 +361,11 @@ The output min/max settings don't have this problem.
 The primary use of this method is for backends to map the channel values held 
 by the Server object into the output needed by the backend connection.
 
+=head1 SETTING UP THE RASPBERRY PI CAMERA
+
+On Raspbian, follow the instructions below for installing the Raspicam v4l
+driver:
+
+L<http://www.linux-projects.org/modules/sections/index.php?op=viewarticle&artid=16>
+
 =cut
