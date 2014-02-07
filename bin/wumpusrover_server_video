@@ -2,9 +2,6 @@
 use v5.14;
 use warnings;
 use Glib qw( TRUE FALSE );
-use EV::Glib;
-#use Glib::EV;
-use AnyEvent;
 use GStreamer;
 use Digest::Adler32::XS;
 use Getopt::Long ();
@@ -105,8 +102,6 @@ sub configure_video
 
 
 {
-    my $cv = AnyEvent->condvar;
-
     #configure_video( $V4L_CONF_PROGRAM, $INPUT_DEV, $WIDTH, $HEIGHT, $CODEC );
     GStreamer->init();
     my $loop = Glib::MainLoop->new( undef, FALSE );
@@ -146,8 +141,7 @@ sub configure_video
     $pipeline->get_bus->add_watch( \&bus_callback, $loop );
 
     $pipeline->set_state( 'playing' );
-    #$loop->run;
-    $cv->recv;
+    $loop->run;
 
     # Cleanup
     $pipeline->set_state( 'null' );
