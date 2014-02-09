@@ -4,6 +4,8 @@ use warnings;
 use Glib qw( TRUE FALSE );
 use GStreamer;
 use Digest::Adler32::XS;
+use IO::Socket::INET ();
+use IO::Select ();
 use Getopt::Long ();
 
 use constant {
@@ -11,17 +13,24 @@ use constant {
     VIDEO_VERSION      => 0x0000,
     VIDEO_ENCODING     => 0x0001,
 };
-use constant LISTEN_PORT => 49001;
+use constant {
+    FLAG_HEARTBEAT => 0,
+};
+use constant HEARTBEAT_TIMEOUT_SEC       => 5;
+use constant HEARTBEAT_SEND_INTERVAL_SEC => 60;
+use constant LISTEN_PORT                 => 49001;
 
 #my $INPUT_DEV        = '/dev/video0';
 my $WIDTH            = 1280;
 my $HEIGHT           = 720;
 my $CODEC            = 'H264';
 my $V4L_CONF_PROGRAM = 'v4l2-ctl';
+my $PORT             = 49001;
 Getopt::Long::GetOptions(
     #'input=s'  => \$INPUT_DEV,
     'w|width=i'  => \$WIDTH,
     'h|height=i' => \$HEIGHT,
+    'p|port=i'   => \$PORT,
 );
 
 
@@ -48,40 +57,56 @@ sub dump_file_callback
     my ($fakesink, $buf, $pad, $user_data) = @_;
     my $frame_data = $buf->data;
     my $frame_size = $buf->size;
+    my $print_callback        = $user_data->{print_callback};
+    my $check_client_callback = $user_data->{check_client_callback};
+    my $add_to_pending_heartbeats_callback =
+        $user_data->{add_to_pending_heartbeats_callback};
     state $called = 0;
 
     my $digest = Digest::Adler32::XS->new;
     $digest->add( $frame_data );
     my $checksum = $digest->hexdigest;
-
     warn "Frame $called, Buffer size: $frame_size, Checksum: $checksum\n";
-    output_video_frame( $frame_data, $frame_size, $WIDTH, $HEIGHT );
+
+    output_video_frame( $frame_data, $frame_size, $checksum, $WIDTH, $HEIGHT,
+        $print_callback, $check_client_callback,
+        $add_to_pending_heartbeats_callback );
 
     $called++;
     return 1;
 }
+
 sub output_video_frame
 {
-    my ($frame_data, $frame_size, $width, $height) = @_;
+    my ($frame_data, $frame_size, $checksum_hex, $width, $height,
+        $print_callback, $check_client_callback,
+        $add_to_pending_heartbeats_callback) = @_;
+    my $flags = 0x00000000;
 
-    my $digest = Digest::Adler32::XS->new;
-    $digest->add( $frame_data );
-    my $checksum = $digest->digest;
+    my $set_heartbeat_flag = $check_client_callback->();
+    if( $set_heartbeat_flag ) {
+        $add_to_pending_heartbeats_callback->( $checksum_hex );
+        $flags |= 1 << FLAG_HEARTBEAT;
+    }
 
+
+    warn "Constructing output headers\n";
     my $out_headers = pack 'nnnNNnnC*'
         ,VIDEO_MAGIC_NUMBER
         ,VIDEO_VERSION
         ,VIDEO_ENCODING
-        ,0x00000000 # 32-bits flags
+        ,$flags
         ,$frame_size
         ,$width
         ,$height
-        ,unpack( 'C*', $checksum )
+        ,unpack( 'C*', hex($checksum_hex) )
         ,( (0x00) x 10 ) # 10 bytes reserved
         ;
 
-    print $out_headers;
-    print $frame_data;
+    warn "Printing headers\n";
+    $print_callback->( $out_headers );
+    warn "Print frame data\n";
+    $print_callback->( $frame_data );
     return 1;
 }
 
@@ -98,6 +123,108 @@ sub configure_video
     warn "Running v4l conf: $exec_str\n";
     (system( $exec_str ) == 0) or die "Couldn't execute $prog: $!\n";
     return 1;
+}
+
+sub setup_network_callbacks
+{
+    my ($port) = @_;
+
+    my $socket = IO::Socket::INET->new(
+        LocalPort => $port,
+        Proto     => 'tcp',
+        Listen    => 1,
+        Reuse     => 1,
+        Blocking  => 0,
+    ) or die "Could not start socket on port $port: $!\n";
+    IO::Handle::blocking( $socket, 0 );
+
+    my $select              = IO::Select->new;
+    my $client              = undef;
+    my $last_heartbeat_send = undef;
+    my %pending_heartbeats  = ();
+
+    my $print_callback = sub {
+        my ($data) = @_;
+        return 1 if ! defined $client;
+        $client->send( $data );
+        return 1;
+    };
+    my $check_client_callback = sub {
+        warn "Checking client\n";
+        if( defined $client) {
+            read_heartbeat( $client, $select, \%pending_heartbeats );
+            # TODO uncomment after implementing heartbeats on the client side
+            #if( is_heartbeat_expired( \%pending_heartbeats ) ) {
+            #    $select->remove( $client );
+            #    $client->close;
+            #    undef $client;
+            #    undef $last_heartbeat_send;
+            #    return 0;
+            #}
+            my $time = time;
+            if( (HEARTBEAT_SEND_INTERVAL_SEC + $time) >= $last_heartbeat_send ){
+                warn "Sending heartbeat at $time\n";
+                $last_heartbeat_send = time;
+                return 1;
+            }
+        }
+        else {
+            if( my $got_client = $socket->accept ) {
+                warn "Got new client connection\n";
+                $client = $got_client;
+                $select->add( $client );
+                $last_heartbeat_send = time;
+            }
+            else {
+                warn "No client connection\n";
+            }
+        }
+
+        return 0;
+    };
+    my $add_to_heartbeat_list_callback = sub {
+        my ($digest) = @_;
+        my $time = time;
+        $pending_heartbeats{$digest} = $time;
+        return 1;
+    };
+
+    return ($print_callback, $check_client_callback,
+        $add_to_heartbeat_list_callback);
+}
+
+sub read_heartbeat
+{
+    my ($client, $select, $pending_heartbeat) = @_;
+    warn "Reading for heartbeat\n";
+    my $buf;
+    if( $select->can_read( 0 ) && $client->recv( \$buf, 512 ) ) {
+        my ($magic_number, $digest) = unpack 'nN', $buf;
+        if( VIDEO_MAGIC_NUMBER == $magic_number ) {
+            warn "Got heartbeat from client\n";
+            delete $pending_heartbeat->{$digest};
+        }
+        else {
+            warn "Got message from client with bad magic number\n";
+        }
+    }
+    return 1;
+}
+
+sub is_heartbeat_expired
+{
+    my ($pending_heartbeats) = @_;
+    my $time = time;
+
+    foreach (keys %$pending_heartbeats) {
+            if( (HEARTBEAT_TIMEOUT_SEC + $pending_heartbeats->{$_}) >= $time ) {
+                warn "Heartbeat $_ sent at $$pending_heartbeats{$_}"
+                    . " has expired \n";
+                return 1;
+            }
+    }
+
+    return 0;
 }
 
 
@@ -128,11 +255,19 @@ sub configure_video
         #device => $INPUT_DEV,
     );
 
+    my ($print_callback, $check_client_callback,
+        $add_to_pending_heartbeats_callback) = setup_network_callbacks( $PORT );
     $fakesink->set(
         'signal-handoffs' => TRUE,
     );
     $fakesink->signal_connect(
         'handoff' => \&dump_file_callback,
+        {
+            print_callback        => $print_callback,
+            check_client_callback => $check_client_callback,
+            add_to_pending_heartbeats_callback =>
+                $add_to_pending_heartbeats_callback
+        },
     );
 
     $pipeline->add( $src, $h264, $capsfilter, $fakesink );
