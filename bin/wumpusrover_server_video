@@ -153,18 +153,17 @@ sub setup_network_callbacks
         warn "Checking client\n";
         if( defined $client) {
             read_heartbeat( $client, $select, \%pending_heartbeats );
-            # TODO uncomment after implementing heartbeats on the client side
-            #if( is_heartbeat_expired( \%pending_heartbeats ) ) {
-            #    $select->remove( $client );
-            #    $client->close;
-            #    undef $client;
-            #    undef $last_heartbeat_send;
-            #    return 0;
-            #}
+            if( is_heartbeat_expired( \%pending_heartbeats ) ) {
+                $select->remove( $client );
+                $client->close;
+                undef $client;
+                undef $last_heartbeat_send;
+                return 0;
+            }
+
             my $time = time;
-            if( (HEARTBEAT_SEND_INTERVAL_SEC + $time) >= $last_heartbeat_send ){
+            if( (HEARTBEAT_SEND_INTERVAL_SEC + $time) <= $last_heartbeat_send ){
                 warn "Sending heartbeat at $time\n";
-                $last_heartbeat_send = time;
                 return 1;
             }
         }
@@ -184,8 +183,10 @@ sub setup_network_callbacks
     };
     my $add_to_heartbeat_list_callback = sub {
         my ($digest) = @_;
-        my $time = time;
-        $pending_heartbeats{$digest} = $time;
+        $last_heartbeat_send = time;
+        $pending_heartbeats{$digest}
+            = $last_heartbeat_send + HEARTBEAT_TIMEOUT_SEC;
+        warn "Setting heartbeat with digest [$digest] at $last_heartbeat_send, expries at $pending_heartbeats{$digest}\n";
         return 1;
     };
 
@@ -217,9 +218,9 @@ sub is_heartbeat_expired
     my $time = time;
 
     foreach (keys %$pending_heartbeats) {
-            if( (HEARTBEAT_TIMEOUT_SEC + $pending_heartbeats->{$_}) >= $time ) {
-                warn "Heartbeat $_ sent at $$pending_heartbeats{$_}"
-                    . " has expired \n";
+            if( $pending_heartbeats->{$_} <= $time ) {
+                warn "Heartbeat $_ expiring at $$pending_heartbeats{$_}"
+                    . " has expired (current time: $time)\n";
                 return 1;
             }
     }
