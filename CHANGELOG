@@ -1,3 +1,8 @@
+0.3 2014-??-??
+
+- Camera uses GStreamer1 with raspisrc driver
+- Migrate to Dist::Zilla
+
 0.2 2014-04-27
 
 - Busywork adding license headers and POD test

@@ -2,7 +2,7 @@
 use v5.14;
 use warnings;
 use Glib qw( TRUE FALSE );
-use GStreamer;
+use GStreamer1;
 use Digest::Adler32::XS;
 use IO::Socket::INET ();
 use IO::Select ();
@@ -19,19 +19,29 @@ use constant {
 use constant HEARTBEAT_TIMEOUT_SEC       => 5;
 use constant HEARTBEAT_SEND_INTERVAL_SEC => 60;
 use constant LISTEN_PORT                 => 49001;
+use constant TYPE_TO_CLASS => {
+    'rpi' => [
+        'rpicamsrc',
+    ],
+    'stdin' => [
+        'fdsrc',
+    ],
+};
 
 #my $INPUT_DEV        = '/dev/video0';
-my $WIDTH            = 1280;
-my $HEIGHT           = 720;
-my $CODEC            = 'H264';
-my $V4L_CONF_PROGRAM = 'v4l2-ctl';
-my $PORT             = 49001;
+my $WIDTH  = 1280;
+my $HEIGHT = 720;
+my $PORT   = 49001;
+my $TYPE   = 'rpi';
 Getopt::Long::GetOptions(
     #'input=s'  => \$INPUT_DEV,
     'w|width=i'  => \$WIDTH,
     'h|height=i' => \$HEIGHT,
     'p|port=i'   => \$PORT,
+    't|type=s'   => \$TYPE,
 );
+die "Type '$TYPE' is not supported\n"
+    unless exists TYPE_TO_CLASS->{$TYPE};
 
 
 sub bus_callback
@@ -40,40 +50,46 @@ sub bus_callback
 
     if( $msg->type & "error" ) {
         warn $msg->error;
-        #$loop->quit;
-        EV::unloop();
+        $loop->quit;
     }
     elsif( $msg->type & "eos" ) {
         warn "End of stream, quitting\n";
-        #$loop->quit;
-        EV::unloop();
+        $loop->quit;
     }
 
     return TRUE;
 }
 
-sub dump_file_callback
+sub get_catch_handoff_callback
 {
-    my ($fakesink, $buf, $pad, $user_data) = @_;
-    my $frame_data = $buf->data;
-    my $frame_size = $buf->size;
-    my $print_callback        = $user_data->{print_callback};
-    my $check_client_callback = $user_data->{check_client_callback};
+    my ($args) = @_;
+    my $print_callback        = $args->{print_callback};
+    my $check_client_callback = $args->{check_client_callback};
     my $add_to_pending_heartbeats_callback =
-        $user_data->{add_to_pending_heartbeats_callback};
-    state $called = 0;
-
+        $args->{add_to_pending_heartbeats_callback};
     my $digest = Digest::Adler32::XS->new;
-    $digest->add( $frame_data );
-    my $checksum = $digest->hexdigest;
-    warn "Frame $called, Buffer size: $frame_size, Checksum: $checksum\n";
+    my $called = 0;
 
-    output_video_frame( $frame_data, $frame_size, $checksum, $WIDTH, $HEIGHT,
-        $print_callback, $check_client_callback,
-        $add_to_pending_heartbeats_callback );
+    my $callback = sub {
+        my ($sink, $data_buf, $pad) = @_;
+        my $frame_size = $data_buf->get_size;
+        my $frame_data = $data_buf->extract_dup( 0, $frame_size,
+            undef, $frame_size );
+        my $data = pack "C*", @$frame_data;
 
-    $called++;
-    return 1;
+        $digest->add( $data );
+        my $checksum = $digest->hexdigest;
+        warn "Frame $called, Buffer size: $frame_size, Checksum: $checksum\n";
+
+        output_video_frame( $data, $frame_size, $checksum, $WIDTH, $HEIGHT,
+            $print_callback, $check_client_callback,
+            $add_to_pending_heartbeats_callback );
+
+        $called++;
+        return 1;
+    };
+
+    return $callback;
 }
 
 sub output_video_frame
@@ -107,21 +123,6 @@ sub output_video_frame
     $print_callback->( $out_headers );
     warn "Print frame data\n";
     $print_callback->( $frame_data );
-    return 1;
-}
-
-sub configure_video
-{
-    my ($prog, $dev, $width, $height, $codec) = @_;
-    return 1 if $dev !~ m!\A /dev!x;
-
-    my $exec_str = $prog . ' --set-fmt-video='
-        . 'width=' . $width
-        . ',height=' . $height
-        . ',pixelformat="' . $codec . '"'
-        . ' -d ' . $dev;
-    warn "Running v4l conf: $exec_str\n";
-    (system( $exec_str ) == 0) or die "Couldn't execute $prog: $!\n";
     return 1;
 }
 
@@ -218,11 +219,11 @@ sub is_heartbeat_expired
     my $time = time;
 
     foreach (keys %$pending_heartbeats) {
-            if( $pending_heartbeats->{$_} <= $time ) {
-                warn "Heartbeat $_ expiring at $$pending_heartbeats{$_}"
-                    . " has expired (current time: $time)\n";
-                return 1;
-            }
+        if( $pending_heartbeats->{$_} <= $time ) {
+            warn "Heartbeat $_ expiring at $$pending_heartbeats{$_}"
+                . " has expired (current time: $time)\n";
+            return 1;
+        }
     }
 
     return 0;
@@ -230,31 +231,29 @@ sub is_heartbeat_expired
 
 
 {
-    #configure_video( $V4L_CONF_PROGRAM, $INPUT_DEV, $WIDTH, $HEIGHT, $CODEC );
-    GStreamer->init();
+    GStreamer1::init([ $0, @ARGV ]);
     my $loop = Glib::MainLoop->new( undef, FALSE );
 
-    my $pipeline = GStreamer::Pipeline->new( 'pipeline' );
-    my ($src, $h264, $capsfilter, $fakesink)
-        = GStreamer::ElementFactory->make(
-            #v4l2src    => 'and_who_are_you',
-            #filesrc    => 'and_who_are_you',
-            fdsrc      => 'and_who_are_you',
-            h264parse  => 'the_proud_lord_said',
-            capsfilter => 'that_i_should_bow_so_low',
-            fakesink   => 'only_a_cat_of_a_different_coat',
-        );
+    my ($src_name, @src_config) = @{ +TYPE_TO_CLASS->{$TYPE} };
 
-    my $caps = GStreamer::Caps::Simple->new( 'video/x-h264',
+    my $pipeline = GStreamer1::Pipeline->new( 'pipeline' );
+    my $src = GStreamer1::ElementFactory::make( $src_name => 'and_who_are_you' );
+    my $h264 = GStreamer1::ElementFactory::make(
+        h264parse => 'the_proud_lord_said' );
+    my $capsfilter = GStreamer1::ElementFactory::make(
+        capsfilter => 'that_i_should_bow_so_low' );
+    my $fakesink = GStreamer1::ElementFactory::make(
+        fakesink   => 'only_a_cat_of_a_different_coat');
+
+    my $caps = GStreamer1::Caps::Simple->new( 'video/x-h264',
         alignment       => 'Glib::String' => 'au',
         'stream-format' => 'Glib::String' => 'byte-stream',
+        width           => 'Glib::Int'    => $WIDTH,
+        height          => 'Glib::Int'    => $HEIGHT,
     );
     $capsfilter->set( caps => $caps );
 
-    $src->set(
-        #location => $INPUT_DEV,
-        #device => $INPUT_DEV,
-    );
+    $src->set( @src_config ) if @src_config;
 
     my ($print_callback, $check_client_callback,
         $add_to_pending_heartbeats_callback) = setup_network_callbacks( $PORT );
@@ -262,19 +261,23 @@ sub is_heartbeat_expired
         'signal-handoffs' => TRUE,
     );
     $fakesink->signal_connect(
-        'handoff' => \&dump_file_callback,
-        {
+        'handoff' => get_catch_handoff_callback({
             print_callback        => $print_callback,
             check_client_callback => $check_client_callback,
             add_to_pending_heartbeats_callback =>
                 $add_to_pending_heartbeats_callback
-        },
+        }),
     );
 
-    $pipeline->add( $src, $h264, $capsfilter, $fakesink );
-    $src->link( $h264, $capsfilter, $fakesink );
+    my @link = ($src, $h264, $capsfilter, $fakesink);
+    $pipeline->add( $_ ) for @link;
+    foreach my $i (0 .. $#link - 1) {
+        my $this = $link[$i];
+        my $next = $link[$i+1];
+        $this->link( $next );
+    }
 
-    $pipeline->get_bus->add_watch( \&bus_callback, $loop );
+    #$pipeline->get_bus->add_watch( \&bus_callback, $loop );
 
     $pipeline->set_state( 'playing' );
     $loop->run;
